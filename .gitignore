@@ -1,0 +1,8 @@
+.DS_Store
+node_modules
+.pycache
+.pycache_check
+__pycache__
+*.pyc
+backend/generated
+backend/uploads

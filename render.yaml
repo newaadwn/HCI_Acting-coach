@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: hci-acting-coach
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
