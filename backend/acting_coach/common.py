@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import cv2
@@ -14,6 +13,8 @@ ASSET_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = ROOT / "face_landmarker.task"
 DEFAULT_ACTOR_CSV_PATH = ROOT / "actor_expression.csv"
 DEFAULT_USER_CSV_PATH = ROOT / "user_expression.csv"
+DEFAULT_RECORDED_VIDEO_CSV_PATH = ROOT / "video_expression_mediapipe.csv"
+DEFAULT_WEBCAM_CSV_PATH = ROOT / "webcam_expression_mediapipe_with_aihub_csv.csv"
 DEFAULT_NEUTRAL_DISTRIBUTION_PATH = ASSET_DIR / "neutral_distribution.csv"
 DEFAULT_ANGER_DISTRIBUTION_PATH = ASSET_DIR / "anger_distribution.csv"
 
@@ -28,38 +29,13 @@ SENSITIVITY = {
 DEFAULT_EMOTION_KEYS = ["joy", "sadness", "anger", "surprise"]
 MEDIAPIPE_NEUTRAL_THRESHOLD = 15
 AIHUB_STD_FLOOR = 0.02
-USER_STD_FLOOR = 0.015
-USER_NEUTRAL_DISTANCE_THRESHOLD = 1.8
-USER_NEUTRAL_DELTA_ENERGY_THRESHOLD = 0.025
 AIHUB_ANGER_SCORE_THRESHOLD = 58
 AIHUB_DISTANCE_MARGIN = 0.95
 AIHUB_MIN_ANGER_CORE = 0.03
-AIHUB_MIN_ANGER_CORE_DELTA = 0.03
 LOW_INTENSITY_NEUTRAL_THRESHOLD = 40
 LOW_INTENSITY_NEUTRAL_AVERAGE = 28
 LOW_INTENSITY_NEUTRAL_ANGER_CORE = 0.22
 LOW_INTENSITY_WEAK_ANGER_SCORE = 62
-
-USER_NEUTRAL_COMPARE_KEYS = [
-    "browDownLeft",
-    "browDownRight",
-    "eyeSquintLeft",
-    "eyeSquintRight",
-    "mouthPressLeft",
-    "mouthPressRight",
-    "noseSneerLeft",
-    "noseSneerRight",
-    "mouthSmileLeft",
-    "mouthSmileRight",
-    "mouthFrownLeft",
-    "mouthFrownRight",
-    "browInnerUp",
-    "browOuterUpLeft",
-    "browOuterUpRight",
-    "eyeWideLeft",
-    "eyeWideRight",
-    "jawOpen",
-]
 
 AIHUB_COMPARE_KEYS = [
     "browDownLeft",
@@ -128,52 +104,6 @@ def load_distribution_csv(csv_path: Path) -> dict[str, dict[str, float]]:
         }
 
     return distribution
-
-
-def distribution_from_baseline_maps(
-    baseline: dict[str, float],
-    std: dict[str, float],
-) -> dict[str, dict[str, float]]:
-    keys = sorted(set(baseline) | set(std))
-    return {
-        key: {
-            "mean": float(baseline.get(key, 0.0)),
-            "std": float(std.get(key, 0.0)),
-        }
-        for key in keys
-    }
-
-
-def load_user_neutral_profile(profile_path: Path) -> dict[str, dict[str, float]]:
-    payload = json.loads(profile_path.read_text(encoding="utf-8"))
-
-    if isinstance(payload, dict) and "baseline" in payload and "std" in payload:
-        baseline = payload.get("baseline")
-        std = payload.get("std")
-        if not isinstance(baseline, dict) or not isinstance(std, dict):
-            raise ValueError("Neutral profile JSON must contain object maps for baseline and std.")
-        return distribution_from_baseline_maps(baseline, std)
-
-    if isinstance(payload, dict):
-        distribution: dict[str, dict[str, float]] = {}
-        for key, value in payload.items():
-            if not isinstance(value, dict):
-                raise ValueError("Neutral profile JSON entries must be objects with mean and std.")
-            distribution[key] = {
-                "mean": float(value.get("mean", 0.0)),
-                "std": float(value.get("std", 0.0)),
-            }
-        return distribution
-
-    raise ValueError("Neutral profile JSON must be an object.")
-
-
-def save_user_neutral_profile(distribution: dict[str, dict[str, float]], profile_path: Path) -> None:
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text(
-        json.dumps(distribution, ensure_ascii=True, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
 
 
 def save_distribution_csv(distribution: dict[str, dict[str, float]], csv_path: Path) -> None:
@@ -254,108 +184,6 @@ def calculate_anger_core(data: dict[str, float]) -> float:
         + data.get("mouthPressLeft", 0.0)
         + data.get("mouthPressRight", 0.0)
     ) / 6
-
-
-def build_user_neutral_distribution(samples: list[dict[str, float]]) -> dict[str, dict[str, float]]:
-    all_keys = sorted({key for sample in samples for key in sample.keys()})
-    distribution: dict[str, dict[str, float]] = {}
-
-    for key in all_keys:
-        values = np.array([sample.get(key, 0.0) for sample in samples], dtype=np.float32)
-        distribution[key] = {
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-        }
-
-    return distribution
-
-
-def calculate_delta_energy(
-    raw_data: dict[str, float],
-    user_neutral_distribution: dict[str, dict[str, float]],
-    keys: list[str] | None = None,
-) -> float:
-    delta_values: list[float] = []
-
-    for key in keys or USER_NEUTRAL_COMPARE_KEYS:
-        if key not in user_neutral_distribution:
-            continue
-
-        value = float(raw_data.get(key, 0.0))
-        baseline_mean = user_neutral_distribution[key]["mean"]
-        delta_values.append(abs(value - baseline_mean))
-
-    if not delta_values:
-        return 0.0
-
-    return float(np.mean(delta_values))
-
-
-def make_relative_blendshapes(
-    raw_data: dict[str, float],
-    user_neutral_distribution: dict[str, dict[str, float]],
-) -> tuple[dict[str, float], dict[str, float]]:
-    relative_data: dict[str, float] = {}
-    delta_data: dict[str, float] = {}
-
-    for key, value in raw_data.items():
-        baseline_mean = user_neutral_distribution.get(key, {"mean": 0.0})["mean"]
-        delta = float(value) - baseline_mean
-        relative_data[key] = max(delta, 0.0)
-        delta_data[key] = delta
-
-    return relative_data, delta_data
-
-
-def add_user_neutral_reference_scores(
-    data: dict[str, float],
-    raw_blendshapes: dict[str, float],
-    user_neutral_distribution: dict[str, dict[str, float]],
-) -> dict[str, float]:
-    user_neutral_distance = calculate_distribution_distance(
-        raw_blendshapes,
-        user_neutral_distribution,
-        USER_NEUTRAL_COMPARE_KEYS,
-        USER_STD_FLOOR,
-    )
-    user_neutral_delta_energy = calculate_delta_energy(
-        raw_blendshapes,
-        user_neutral_distribution,
-        USER_NEUTRAL_COMPARE_KEYS,
-    )
-
-    user_neutral_score = 0.0 if user_neutral_distance is None else 100 / (1 + user_neutral_distance)
-    data["user_neutral_distance"] = user_neutral_distance
-    data["user_neutral_delta_energy"] = user_neutral_delta_energy
-    data["user_neutral_score"] = user_neutral_score
-    return data
-
-
-def add_aihub_anger_reference_scores(
-    data: dict[str, float],
-    raw_blendshapes: dict[str, float],
-) -> dict[str, float]:
-    user_neutral_distance = data.get("user_neutral_distance")
-    aihub_anger_distance = calculate_distribution_distance(
-        raw_blendshapes,
-        ANGER_DISTRIBUTION,
-        AIHUB_COMPARE_KEYS,
-        AIHUB_STD_FLOOR,
-    )
-    data["aihub_anger_distance"] = aihub_anger_distance
-
-    if user_neutral_distance is None or aihub_anger_distance is None:
-        data["aihub_anger_score"] = 0.0
-        data["aihub_reference_emotion"] = "Unknown"
-        return data
-
-    total_distance = user_neutral_distance + aihub_anger_distance
-    anger_score = 50.0 if total_distance == 0 else user_neutral_distance / total_distance * 100
-    data["aihub_anger_score"] = anger_score
-    data["aihub_reference_emotion"] = (
-        "Anger" if aihub_anger_distance < user_neutral_distance * AIHUB_DISTANCE_MARGIN else "UserNeutral"
-    )
-    return data
 
 
 def _calculate_emotion_raws(data: dict[str, float]) -> tuple[float, float, float, float]:
@@ -495,19 +323,6 @@ def calculate_performance_emotions(data: dict[str, float]) -> dict[str, float]:
     )
 
 
-def calculate_relative_emotions(relative_data: dict[str, float]) -> dict[str, float]:
-    joy_raw, sadness_raw, anger_raw, surprise_raw = _calculate_emotion_raws(relative_data)
-    scores: dict[str, float] = {}
-    return _append_emotion_scores(
-        scores,
-        joy_raw,
-        sadness_raw,
-        anger_raw,
-        surprise_raw,
-        add_neutral=False,
-    )
-
-
 def calculate_actor_emotions(data: dict[str, float]) -> dict[str, float]:
     return calculate_performance_emotions(data)
 
@@ -589,122 +404,6 @@ def get_dominant_emotion(
     if include_data:
         return result[0], result[1], scores
     return result
-
-
-def get_personalized_dominant_emotion(
-    data: dict[str, float],
-    include_data: bool = False,
-) -> tuple[str, float] | tuple[str, float, dict[str, float]]:
-    emotions = {
-        "Joy": data.get("joy", 0.0),
-        "Sadness": data.get("sadness", 0.0),
-        "Anger": data.get("anger", 0.0),
-        "Surprise": data.get("surprise", 0.0),
-    }
-    mediapipe_emotion = max(emotions, key=emotions.get)
-    mediapipe_percent = emotions[mediapipe_emotion]
-
-    data["mediapipe_label"] = mediapipe_emotion
-    data["mediapipe_percent"] = mediapipe_percent
-
-    user_neutral_distance = data.get("user_neutral_distance")
-    user_neutral_delta_energy = float(data.get("user_neutral_delta_energy", 0.0) or 0.0)
-    user_neutral_score = float(data.get("user_neutral_score", 0.0) or 0.0)
-    aihub_anger_distance = data.get("aihub_anger_distance")
-    aihub_anger_score = float(data.get("aihub_anger_score", 0.0) or 0.0)
-    anger_core_delta = float(data.get("anger_core_delta", 0.0) or 0.0)
-    data["anger_core_delta"] = anger_core_delta
-
-    if user_neutral_distance is None:
-        if mediapipe_percent < MEDIAPIPE_NEUTRAL_THRESHOLD:
-            data["final_source"] = "mediapipe"
-            result = ("Neutral", clamp(100 - mediapipe_percent))
-        else:
-            data["final_source"] = "mediapipe"
-            result = (mediapipe_emotion, mediapipe_percent)
-
-        if include_data:
-            return result[0], result[1], data
-        return result
-
-    is_user_neutral = (
-        user_neutral_distance <= USER_NEUTRAL_DISTANCE_THRESHOLD
-        and user_neutral_delta_energy <= USER_NEUTRAL_DELTA_ENERGY_THRESHOLD
-    )
-
-    if aihub_anger_distance is not None:
-        anger_csv_confirms = (
-            aihub_anger_distance < user_neutral_distance * AIHUB_DISTANCE_MARGIN
-            and aihub_anger_score >= AIHUB_ANGER_SCORE_THRESHOLD
-            and anger_core_delta >= AIHUB_MIN_ANGER_CORE_DELTA
-        )
-    else:
-        anger_csv_confirms = False
-
-    data["is_user_neutral"] = is_user_neutral
-    data["anger_csv_confirms"] = anger_csv_confirms
-
-    if is_user_neutral or mediapipe_percent < MEDIAPIPE_NEUTRAL_THRESHOLD:
-        if anger_csv_confirms:
-            data["final_source"] = "user_neutral_baseline+anger_csv"
-            result = ("Anger", max(30.0, aihub_anger_score))
-        else:
-            data["final_source"] = "user_neutral_baseline"
-            result = ("Neutral", user_neutral_score)
-    elif mediapipe_emotion == "Anger":
-        if anger_csv_confirms:
-            data["final_source"] = "relative_blendshape+anger_csv"
-            result = ("Anger", max(mediapipe_percent, aihub_anger_score))
-        else:
-            non_anger_emotions = {
-                "Joy": data.get("joy", 0.0),
-                "Sadness": data.get("sadness", 0.0),
-                "Surprise": data.get("surprise", 0.0),
-            }
-            second_emotion = max(non_anger_emotions, key=non_anger_emotions.get)
-            second_percent = non_anger_emotions[second_emotion]
-
-            if second_percent >= MEDIAPIPE_NEUTRAL_THRESHOLD:
-                data["final_source"] = "relative_blendshape_anger_rejected"
-                result = (second_emotion, second_percent)
-            else:
-                data["final_source"] = "anger_rejected_as_neutral"
-                result = ("Neutral", user_neutral_score)
-    elif anger_csv_confirms and mediapipe_percent < 35:
-        data["final_source"] = "anger_csv_override_low_confidence"
-        result = ("Anger", max(mediapipe_percent, aihub_anger_score))
-    else:
-        data["final_source"] = "relative_blendshape"
-        result = (mediapipe_emotion, mediapipe_percent)
-
-    if include_data:
-        return result[0], result[1], data
-    return result
-
-
-def score_personalized_user_frame(
-    raw_blendshapes: dict[str, float],
-    user_neutral_distribution: dict[str, dict[str, float]],
-) -> dict[str, float]:
-    data = dict(raw_blendshapes)
-    relative_blendshapes, delta_blendshapes = make_relative_blendshapes(
-        raw_blendshapes,
-        user_neutral_distribution,
-    )
-
-    for key, value in delta_blendshapes.items():
-        data[f"delta_{key}"] = value
-
-    data.update(calculate_relative_emotions(relative_blendshapes))
-    data["anger_core_delta"] = calculate_anger_core(relative_blendshapes)
-    data["anger_core_raw"] = calculate_anger_core(raw_blendshapes)
-    data = add_user_neutral_reference_scores(data, raw_blendshapes, user_neutral_distribution)
-    data = add_aihub_anger_reference_scores(data, raw_blendshapes)
-
-    emotion, percent, data = get_personalized_dominant_emotion(data, include_data=True)
-    data["dominant_emotion"] = emotion
-    data["dominant_percent"] = percent
-    return data
 
 
 def get_emotion_color(emotion: str) -> tuple[int, int, int]:

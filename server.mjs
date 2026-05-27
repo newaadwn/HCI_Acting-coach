@@ -395,7 +395,8 @@ function getSessionPaths(sessionId) {
     sessionGeneratedDir,
     sessionUploadsDir,
     activeActorCsvPath: join(sessionGeneratedDir, "actor_expression.csv"),
-    activeUserCsvPath: join(sessionGeneratedDir, "user_expression.csv"),
+    activeUserCsvPath: join(sessionGeneratedDir, "video_expression_mediapipe.csv"),
+    activeWebcamCsvPath: join(sessionGeneratedDir, "webcam_expression_mediapipe_with_aihub_csv.csv"),
   };
 }
 
@@ -407,12 +408,24 @@ function resolveActorCsvPath(mode = "active", sessionId = DEFAULT_SESSION_ID) {
   return existsSync(activeActorCsvPath) ? activeActorCsvPath : sampleActorCsvPath;
 }
 
-function resolveUserCsvPath(mode = "active", sessionId = DEFAULT_SESSION_ID) {
+function resolveUserCsvPath(mode = "active", sessionId = DEFAULT_SESSION_ID, source = "active") {
   if (mode === "sample") {
     return sampleUserCsvPath;
   }
-  const { activeUserCsvPath } = getSessionPaths(sessionId);
-  return existsSync(activeUserCsvPath) ? activeUserCsvPath : sampleUserCsvPath;
+  const { activeUserCsvPath, activeWebcamCsvPath } = getSessionPaths(sessionId);
+  if (source === "webcam" && existsSync(activeWebcamCsvPath)) {
+    return activeWebcamCsvPath;
+  }
+  if (source === "recorded" && existsSync(activeUserCsvPath)) {
+    return activeUserCsvPath;
+  }
+  if (existsSync(activeUserCsvPath)) {
+    return activeUserCsvPath;
+  }
+  if (existsSync(activeWebcamCsvPath)) {
+    return activeWebcamCsvPath;
+  }
+  return sampleUserCsvPath;
 }
 
 function buildActorProfile(mode = "active", sessionId = DEFAULT_SESSION_ID) {
@@ -432,38 +445,33 @@ function buildActorProfile(mode = "active", sessionId = DEFAULT_SESSION_ID) {
   );
 }
 
-function buildUserProfile(mode = "active", sessionId = DEFAULT_SESSION_ID) {
-  const { activeUserCsvPath } = getSessionPaths(sessionId);
-  const csvPath = resolveUserCsvPath(mode, sessionId);
+function buildUserProfile(mode = "active", sessionId = DEFAULT_SESSION_ID, source = "active") {
+  const { activeUserCsvPath, activeWebcamCsvPath } = getSessionPaths(sessionId);
+  const csvPath = resolveUserCsvPath(mode, sessionId, source);
   const timeline = buildTimeline(parseCsvRows(csvPath));
-  const isGenerated = csvPath === activeUserCsvPath;
+  const isRecorded = csvPath === activeUserCsvPath;
+  const isWebcam = csvPath === activeWebcamCsvPath;
+  const isGenerated = isRecorded || isWebcam;
   const isSample = mode === "sample" || !isGenerated;
-  const isPersonalized = timeline.some((frame) =>
-    [
-      "user_neutral_baseline",
-      "user_neutral_baseline+anger_csv",
-      "relative_blendshape",
-      "relative_blendshape+anger_csv",
-      "relative_blendshape_anger_rejected",
-      "anger_rejected_as_neutral",
-      "anger_csv_override_low_confidence",
-    ].includes(frame.finalSource)
-  );
 
   return buildProfileFromTimeline(
     timeline,
     "user",
     isSample && !isGenerated
       ? "HCI-acting-coach sample user take"
-      : isPersonalized
-        ? "Analyzed user take with personalized neutral baseline"
-        : "Analyzed user take",
+      : isWebcam
+        ? "Analyzed webcam take with AI-Hub CSV reference"
+        : "Analyzed user take with AI-Hub CSV reference",
     isSample && !isGenerated
       ? "Profile derived from the bundled user_expression.csv sample."
-      : isPersonalized
-        ? "Profile derived from a freshly analyzed user take using the latest HCI-acting-coach personalized neutral baseline plus AI-Hub anger reference pipeline."
-        : "Profile derived from a freshly analyzed user take using the latest HCI-acting-coach MediaPipe + AI-Hub CSV reference pipeline.",
-    isSample && !isGenerated ? "hci-acting-coach-user-demo" : "hci-acting-coach-user-upload"
+      : isWebcam
+        ? "Profile derived from a freshly analyzed webcam take using MediaPipe plus the AI-Hub anger/neutral CSV distribution pipeline."
+        : "Profile derived from a freshly analyzed recorded take using MediaPipe plus the AI-Hub anger/neutral CSV distribution pipeline.",
+    isSample && !isGenerated
+      ? "hci-acting-coach-user-demo"
+      : isWebcam
+        ? "hci-acting-coach-webcam-aihub-csv"
+        : "hci-acting-coach-recorded-video-aihub-csv"
   );
 }
 
@@ -527,12 +535,13 @@ function deriveComparison(actorProfile, userProfile) {
 function buildComparisonPayload({
   actorMode = "active",
   userMode = "active",
+  userSource = "active",
   sourceLabel,
   sourceDetail,
   sessionId = DEFAULT_SESSION_ID,
 } = {}) {
   const actorProfile = buildActorProfile(actorMode, sessionId);
-  const userProfile = buildUserProfile(userMode, sessionId);
+  const userProfile = buildUserProfile(userMode, sessionId, userSource);
 
   return {
     actorProfile,
@@ -594,28 +603,6 @@ function readRequestHeader(request, headerName) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function parseNeutralProfileHeader(request) {
-  const rawValue = readRequestHeader(request, "x-neutral-profile");
-  if (!rawValue) {
-    return null;
-  }
-
-  try {
-    const decoded = decodeURIComponent(String(rawValue));
-    const payload = JSON.parse(decoded);
-    if (!payload || typeof payload !== "object") {
-      throw new Error("Neutral profile must be a JSON object.");
-    }
-    return payload;
-  } catch (error) {
-    throw new Error(
-      error instanceof Error
-        ? `Neutral calibration payload was invalid: ${error.message}`
-        : "Neutral calibration payload was invalid."
-    );
-  }
-}
-
 function getRequestSessionId(request) {
   return normalizeSessionId(readRequestHeader(request, "x-session-id")) || DEFAULT_SESSION_ID;
 }
@@ -631,14 +618,6 @@ function isLocalHostRequest(request) {
     .toLowerCase();
   const hostname = hostValue.split(":")[0];
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-}
-
-function saveNeutralProfile(profile, prefix, sessionId = DEFAULT_SESSION_ID) {
-  const { sessionGeneratedDir } = getSessionPaths(sessionId);
-  mkdirSync(sessionGeneratedDir, { recursive: true });
-  const filePath = join(sessionGeneratedDir, `${prefix}-${Date.now()}-${randomUUID()}.json`);
-  writeFileSync(filePath, JSON.stringify(profile, null, 2));
-  return filePath;
 }
 
 function runPythonScript(scriptName, args = []) {
@@ -680,7 +659,7 @@ const server = createServer(async (request, response) => {
 
   try {
     if (request.method === "GET" && url.pathname === "/api/health") {
-      const { activeActorCsvPath, activeUserCsvPath } = getSessionPaths(sessionId);
+      const { activeActorCsvPath, activeUserCsvPath, activeWebcamCsvPath } = getSessionPaths(sessionId);
       sendJson(response, 200, {
         ok: true,
         backend: "node",
@@ -690,7 +669,9 @@ const server = createServer(async (request, response) => {
         hasSampleActorCsv: existsSync(sampleActorCsvPath),
         hasSampleUserCsv: existsSync(sampleUserCsvPath),
         hasGeneratedActorCsv: existsSync(activeActorCsvPath),
-        hasGeneratedUserCsv: existsSync(activeUserCsvPath),
+        hasGeneratedUserCsv: existsSync(activeUserCsvPath) || existsSync(activeWebcamCsvPath),
+        hasGeneratedRecordedVideoCsv: existsSync(activeUserCsvPath),
+        hasGeneratedWebcamCsv: existsSync(activeWebcamCsvPath),
       });
       return;
     }
@@ -751,7 +732,6 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/api/analysis/user-upload") {
-      const neutralProfile = parseNeutralProfileHeader(request);
       const uploadPath = await saveUploadedVideo(request, "user-take", sessionId);
       const { sessionGeneratedDir, activeUserCsvPath } = getSessionPaths(sessionId);
       mkdirSync(sessionGeneratedDir, { recursive: true });
@@ -763,11 +743,6 @@ const server = createServer(async (request, response) => {
         activeUserCsvPath,
         "--headless",
       ];
-
-      if (neutralProfile) {
-        const neutralProfilePath = saveNeutralProfile(neutralProfile, "user-neutral-profile", sessionId);
-        scriptArgs.push("--neutral-profile", neutralProfilePath);
-      }
 
       await runPythonScript("analyze_user_video.py", scriptArgs);
 
@@ -794,13 +769,13 @@ const server = createServer(async (request, response) => {
         return;
       }
 
-      const { sessionGeneratedDir, activeUserCsvPath } = getSessionPaths(sessionId);
+      const { sessionGeneratedDir, activeWebcamCsvPath } = getSessionPaths(sessionId);
       mkdirSync(sessionGeneratedDir, { recursive: true });
       await runPythonScript("analyze_webcam.py", [
         "--model-path",
         modelAssetPath,
         "--output-csv",
-        activeUserCsvPath,
+        activeWebcamCsvPath,
       ]);
 
       sendJson(
@@ -809,9 +784,11 @@ const server = createServer(async (request, response) => {
         buildComparisonPayload({
           actorMode: "active",
           userMode: "active",
+          userSource: "webcam",
           sessionId,
           sourceLabel: "Desktop webcam comparison",
-          sourceDetail: "Comparison built from the current actor reference and a freshly analyzed desktop webcam take.",
+          sourceDetail:
+            "Comparison built from the current actor reference and a freshly analyzed desktop webcam take using the AI-Hub anger/neutral CSV distribution pipeline.",
         })
       );
       return;

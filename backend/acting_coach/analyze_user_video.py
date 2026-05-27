@@ -9,7 +9,7 @@ import pandas as pd
 
 from common import (
     DEFAULT_MODEL_PATH,
-    DEFAULT_USER_CSV_PATH,
+    DEFAULT_RECORDED_VIDEO_CSV_PATH,
     add_aihub_reference_scores,
     blendshapes_to_dict,
     build_face_landmarker,
@@ -17,26 +17,23 @@ from common import (
     draw_emotion_box,
     get_dominant_emotion,
     get_face_box,
-    load_user_neutral_profile,
-    score_personalized_user_frame,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze a recorded user performance video with optional personalized neutral calibration."
+        description="Analyze a recorded user performance video with MediaPipe and AI-Hub CSV distributions."
     )
     parser.add_argument("video_path", type=Path, help="Path to the recorded user performance video file.")
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH, help="Path to face_landmarker.task.")
-    parser.add_argument("--output-csv", type=Path, default=DEFAULT_USER_CSV_PATH, help="Path to save user_expression.csv.")
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=DEFAULT_RECORDED_VIDEO_CSV_PATH,
+        help="Path to save video_expression_mediapipe.csv.",
+    )
     parser.add_argument("--sample-every", type=int, default=3, help="Analyze every Nth frame.")
     parser.add_argument("--headless", action="store_true", help="Disable the OpenCV preview window.")
-    parser.add_argument(
-        "--neutral-profile",
-        type=Path,
-        default=None,
-        help="Optional JSON file containing the browser-calibrated neutral baseline profile.",
-    )
     return parser.parse_args()
 
 
@@ -50,21 +47,13 @@ def main() -> int:
         print(f"Could not open video: {args.video_path}")
         return 1
 
-    neutral_distribution = None
-    if args.neutral_profile is not None:
-        neutral_distribution = load_user_neutral_profile(args.neutral_profile)
-        print(f"Loaded personalized neutral profile from {args.neutral_profile}")
-
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if fps <= 0:
         fps = 30.0
     delay = max(1, int(1000 / fps))
 
-    if neutral_distribution is None:
-        print("User performance video opened. Starting analysis with the default actor-style pipeline.")
-    else:
-        print("User performance video opened. Starting analysis with the personalized neutral baseline pipeline.")
+    print("User performance video opened. Starting analysis with the AI-Hub anger/neutral CSV pipeline.")
 
     if not args.headless:
         print("Press q to stop early and save the CSV.")
@@ -94,17 +83,12 @@ def main() -> int:
                 raw_blendshapes = blendshapes_to_dict(detection_result.face_blendshapes[0])
                 data = {"frame": frame_idx}
 
-                if neutral_distribution is None:
-                    data.update(raw_blendshapes)
-                    data = calculate_user_emotions(data)
-                    data = add_aihub_reference_scores(data)
-                    emotion, percent = get_dominant_emotion(data)
-                    data["dominant_emotion"] = emotion
-                    data["dominant_percent"] = percent
-                else:
-                    data.update(score_personalized_user_frame(raw_blendshapes, neutral_distribution))
-                    emotion = str(data.get("dominant_emotion", "Neutral"))
-                    percent = float(data.get("dominant_percent", 0.0) or 0.0)
+                data.update(raw_blendshapes)
+                data = calculate_user_emotions(data)
+                data = add_aihub_reference_scores(data)
+                emotion, percent = get_dominant_emotion(data)
+                data["dominant_emotion"] = emotion
+                data["dominant_percent"] = percent
 
                 last_box = get_face_box(face_landmarks, width, height)
                 last_emotion = emotion
