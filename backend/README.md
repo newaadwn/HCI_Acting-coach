@@ -11,6 +11,9 @@ Current app runtime:
 
 - `server.mjs` is the main server used by the browser app
 - it exposes HCI-based analysis endpoints for uploaded reference videos, recorded user takes, and the desktop webcam flow
+- recorded user takes are written as `video_expression_mediapipe.csv`
+- desktop webcam runs are written as `webcam_expression_mediapipe_with_aihub_csv.csv`
+- both user-take paths use MediaPipe plus `anger_distribution.csv` / `neutral_distribution.csv`, and the frontend reads `dominant_emotion` / `dominant_percent` through the server JSON output
 
 Python pipeline:
 

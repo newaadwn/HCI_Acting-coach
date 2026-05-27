@@ -17,6 +17,7 @@ const LIVE_EMOTION_META = EMOTION_META.filter((emotion) => emotion.id !== "neutr
 const LIVE_EMOTION_COLOR = Object.fromEntries(EMOTION_META.map((emotion) => [emotion.id, emotion.color]));
 const LIVE_DISTRIBUTION_PATHS = {
   anger: "/backend/acting_coach/anger_distribution.csv",
+  neutral: "/backend/acting_coach/neutral_distribution.csv",
 };
 const LIVE_USER_NEUTRAL_COMPARE_KEYS = [
   "browDownLeft",
@@ -63,7 +64,12 @@ const LIVE_USER_NEUTRAL_DISTANCE_THRESHOLD = 1.8;
 const LIVE_USER_NEUTRAL_DELTA_ENERGY_THRESHOLD = 0.025;
 const LIVE_AIHUB_ANGER_SCORE_THRESHOLD = 58;
 const LIVE_AIHUB_DISTANCE_MARGIN = 0.95;
+const LIVE_AIHUB_MIN_ANGER_CORE = 0.03;
 const LIVE_AIHUB_MIN_ANGER_CORE_DELTA = 0.03;
+const LIVE_LOW_INTENSITY_NEUTRAL_THRESHOLD = 40;
+const LIVE_LOW_INTENSITY_NEUTRAL_AVERAGE = 28;
+const LIVE_LOW_INTENSITY_NEUTRAL_ANGER_CORE = 0.22;
+const LIVE_LOW_INTENSITY_WEAK_ANGER_SCORE = 62;
 const LIVE_BLENDSHAPE_SMOOTHING_ALPHA = 0.65;
 
 const ANALYSIS_STEPS = [
@@ -393,23 +399,8 @@ async function analyzeReferenceVideo(file) {
   return uploadVideoForAnalysis("/api/analysis/reference-upload", file, file.name || "reference-video.mp4");
 }
 
-function serializeNeutralProfileHeader(neutralProfile) {
-  if (!neutralProfile?.baseline || !neutralProfile?.std) {
-    return "";
-  }
-
-  try {
-    return encodeURIComponent(JSON.stringify(neutralProfile));
-  } catch {
-    return "";
-  }
-}
-
-async function analyzeRecordedTake(blob, neutralProfile = null) {
-  const encodedNeutralProfile = serializeNeutralProfileHeader(neutralProfile);
-  return uploadVideoForAnalysis("/api/analysis/user-upload", blob, "recorded-take.webm", encodedNeutralProfile
-    ? { "X-Neutral-Profile": encodedNeutralProfile }
-    : {});
+async function analyzeRecordedTake(blob) {
+  return uploadVideoForAnalysis("/api/analysis/user-upload", blob, "recorded-take.webm");
 }
 
 async function runDesktopWebcamAnalysis() {
@@ -453,34 +444,6 @@ function getFinalSourceLabel(source) {
 
   if (source === "mediapipe+csv_score") {
     return "MediaPipe + CSV score";
-  }
-
-  if (source === "user_neutral_baseline") {
-    return "Personal neutral baseline";
-  }
-
-  if (source === "user_neutral_baseline+anger_csv") {
-    return "Neutral baseline + anger CSV";
-  }
-
-  if (source === "relative_blendshape") {
-    return "Relative blendshape";
-  }
-
-  if (source === "relative_blendshape+anger_csv") {
-    return "Relative blendshape + anger CSV";
-  }
-
-  if (source === "relative_blendshape_anger_rejected") {
-    return "Relative blendshape, anger rejected";
-  }
-
-  if (source === "anger_rejected_as_neutral") {
-    return "Anger rejected to neutral";
-  }
-
-  if (source === "anger_csv_override_low_confidence") {
-    return "Anger CSV override";
   }
 
   return source === "mediapipe" ? "MediaPipe" : "Backend mixed";
@@ -1078,26 +1041,16 @@ function renderNeutralCalibrationStatus() {
     return;
   }
 
-  const statusLabel = appState.neutralCalibrationActive
-    ? "Calibrating neutral"
-    : appState.liveTrackingAvailable
-      ? "Overlay ready"
-      : "Camera only";
-  const bodyCopy = appState.neutralCalibrationActive
-    ? `Hold a relaxed neutral face. Progress: ${getLiveCalibrationProgressLabel()}`
-    : appState.liveTrackingAvailable
-      ? appState.liveTrackingMessage || "Face tracking and emotion overlay are ready. Start recording when your resting face looks stable."
-      : appState.liveTrackingMessage || "If the overlay is still loading, recording can still start and the backend analysis will run after you stop.";
-  const stateClass = appState.neutralCalibrationActive
-    ? "is-active"
-    : appState.liveTrackingAvailable
-      ? "is-ready"
-      : "";
+  const statusLabel = appState.liveTrackingAvailable ? "CSV overlay ready" : "Camera only";
+  const bodyCopy = appState.liveTrackingAvailable
+    ? appState.liveTrackingMessage || "Face tracking uses MediaPipe plus the AI-Hub anger/neutral CSV distributions."
+    : appState.liveTrackingMessage || "If the overlay is still loading, recording can still start and backend analysis will run after you stop.";
+  const stateClass = appState.liveTrackingAvailable ? "is-ready" : "";
 
   panel.innerHTML = `
     <div class="neutral-calibration-card ${stateClass}">
       <div class="neutral-calibration-head">
-        <strong>Live preview status</strong>
+        <strong>Live CSV status</strong>
         <span>${escapeHtml(statusLabel)}</span>
       </div>
       <p>${escapeHtml(bodyCopy)}</p>
@@ -1133,20 +1086,13 @@ function updateRecordingStatusMessage() {
     return;
   }
 
-  if (appState.neutralCalibrationActive) {
-    status.innerHTML = `<div class="callout callout-info">Neutral calibration is running. Hold still for ${escapeHtml(
-      getLiveCalibrationProgressLabel()
-    )} so the live preview can stop mistaking your resting face for an emotion. Recording unlocks automatically when this finishes.</div>`;
-    return;
-  }
-
   if (appState.cameraError) {
     status.innerHTML = `<div class="callout callout-danger">${escapeHtml(appState.cameraError)}</div>`;
     return;
   }
 
   status.innerHTML =
-    '<div class="status-note">Reference emotion results are directly below the actor clip on the left. On the right, press <strong>Start recording</strong> to run a 3-second countdown, then both videos begin together and the final comparison opens automatically after backend scoring.</div>';
+    '<div class="status-note">After you stop recording, the final comparison opens automatically.</div>';
 }
 
 function inferTakeAnalysisStepIndex(message) {
@@ -1344,18 +1290,19 @@ function parseLiveDistributionCsv(csvText) {
 
 async function ensureLiveAihubDistributions() {
   if (!liveAihubDistributionPromise) {
-    liveAihubDistributionPromise = fetch(LIVE_DISTRIBUTION_PATHS.anger, {
-      headers: { Accept: "text/csv" },
-    })
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error("Could not load anger distribution CSV.");
-        }
-        return response.text();
-      })
-      .then((angerCsv) => ({
-        anger: parseLiveDistributionCsv(angerCsv),
-      }))
+    liveAihubDistributionPromise = Promise.all(
+      Object.entries(LIVE_DISTRIBUTION_PATHS).map(([key, path]) =>
+        fetch(path, {
+          headers: { Accept: "text/csv" },
+        }).then((response) => {
+          if (!response.ok) {
+            throw new Error(`Could not load ${key} distribution CSV.`);
+          }
+          return response.text().then((csvText) => [key, parseLiveDistributionCsv(csvText)]);
+        })
+      )
+    )
+      .then((entries) => Object.fromEntries(entries))
       .catch((error) => {
         liveAihubDistributionPromise = null;
         throw error;
@@ -1427,15 +1374,23 @@ function calculateLiveUserNeutralScores(rawBlendshapeMap) {
   };
 }
 
-function calculateLiveAihubScores(rawBlendshapeMap, distributions, userNeutralDistance) {
-  if (!distributions?.anger) {
+function calculateLiveAihubScores(rawBlendshapeMap, distributions) {
+  if (!distributions?.anger || !distributions?.neutral) {
     return {
       referenceEmotion: "",
+      neutralDistance: null,
       angerDistance: null,
+      neutralScore: 0,
       angerScore: 0,
     };
   }
 
+  const neutralDistance = calculateLiveDistributionDistance(
+    rawBlendshapeMap,
+    distributions.neutral,
+    LIVE_AIHUB_COMPARE_KEYS,
+    LIVE_AIHUB_STD_FLOOR
+  );
   const angerDistance = calculateLiveDistributionDistance(
     rawBlendshapeMap,
     distributions.anger,
@@ -1443,20 +1398,25 @@ function calculateLiveAihubScores(rawBlendshapeMap, distributions, userNeutralDi
     LIVE_AIHUB_STD_FLOOR
   );
 
-  if (userNeutralDistance == null || angerDistance == null) {
+  if (neutralDistance == null || angerDistance == null) {
     return {
       referenceEmotion: "",
+      neutralDistance,
       angerDistance,
+      neutralScore: 0,
       angerScore: 0,
     };
   }
 
-  const totalDistance = userNeutralDistance + angerDistance;
-  const angerScore = totalDistance === 0 ? 50 : (userNeutralDistance / totalDistance) * 100;
+  const totalDistance = neutralDistance + angerDistance;
+  const neutralScore = totalDistance === 0 ? 50 : (angerDistance / totalDistance) * 100;
+  const angerScore = totalDistance === 0 ? 50 : (neutralDistance / totalDistance) * 100;
 
   return {
-    referenceEmotion: angerDistance < userNeutralDistance ? "Anger" : "UserNeutral",
+    referenceEmotion: angerDistance < neutralDistance ? "Anger" : "Neutral",
+    neutralDistance,
     angerDistance,
+    neutralScore,
     angerScore,
   };
 }
@@ -1472,58 +1432,50 @@ function calculateLiveAngerCore(blendshapeMap) {
   ) / 6;
 }
 
-function getLiveDominantEmotion(scores, personalizedDetails) {
+function getLiveDominantEmotion(scores, aihubDetails, rawBlendshapeMap) {
   const mediapipeDominant = LIVE_EMOTION_META.reduce((best, emotion) => {
     return (scores[emotion.id] || 0) > (scores[best] || 0) ? emotion.id : best;
   }, LIVE_EMOTION_META[0].id);
   const mediapipePercent = scores[mediapipeDominant] || 0;
-  const userNeutralDistance = personalizedDetails?.userNeutralDistance;
-  const userNeutralDeltaEnergy = personalizedDetails?.userNeutralDeltaEnergy || 0;
-  const userNeutralScore = personalizedDetails?.userNeutralScore || 0;
-  const angerDistance = personalizedDetails?.angerDistance;
-  const angerScore = personalizedDetails?.angerScore || 0;
-  const angerCoreDelta = personalizedDetails?.angerCoreDelta || 0;
+  const neutralDistance = aihubDetails?.neutralDistance;
+  const angerDistance = aihubDetails?.angerDistance;
+  const neutralScore = aihubDetails?.neutralScore || 0;
+  const angerScore = aihubDetails?.angerScore || 0;
+  const angerCore = calculateLiveAngerCore(rawBlendshapeMap || {});
   const mediapipeLabel = getLiveEmotionMeta(mediapipeDominant).label;
+  const expressiveAverage =
+    LIVE_EMOTION_META.reduce((sum, emotion) => sum + (scores[emotion.id] || 0), 0) / LIVE_EMOTION_META.length;
+  const neutralPercent = Math.max(100 - mediapipePercent, neutralScore);
+  const angerIsCloser =
+    neutralDistance != null && angerDistance != null
+      ? angerDistance < neutralDistance * LIVE_AIHUB_DISTANCE_MARGIN
+      : false;
 
-  if (userNeutralDistance == null) {
-    if (mediapipePercent < LIVE_MEDIAPIPE_NEUTRAL_THRESHOLD) {
-      return {
-        id: "neutral",
-        label: "Neutral",
-        percent: Math.max(100 - mediapipePercent, 0),
-        finalSource: "mediapipe",
-        mediapipeLabel,
-        mediapipePercent,
-      };
-    }
+  const lowIntensityNeutral =
+    mediapipePercent < LIVE_LOW_INTENSITY_NEUTRAL_THRESHOLD &&
+    expressiveAverage < LIVE_LOW_INTENSITY_NEUTRAL_AVERAGE &&
+    angerCore < LIVE_LOW_INTENSITY_NEUTRAL_ANGER_CORE &&
+    angerScore < LIVE_LOW_INTENSITY_WEAK_ANGER_SCORE;
 
+  if (lowIntensityNeutral) {
     return {
-      id: mediapipeDominant,
-      label: mediapipeLabel,
-      percent: mediapipePercent,
-      finalSource: "mediapipe",
+      id: "neutral",
+      label: "Neutral",
+      percent: neutralPercent,
+      finalSource: "csv_label_aux",
       mediapipeLabel,
       mediapipePercent,
     };
   }
 
-  const isUserNeutral =
-    userNeutralDistance <= LIVE_USER_NEUTRAL_DISTANCE_THRESHOLD &&
-    userNeutralDeltaEnergy <= LIVE_USER_NEUTRAL_DELTA_ENERGY_THRESHOLD;
-  const angerCsvConfirms =
-    angerDistance != null &&
-    angerDistance < userNeutralDistance * LIVE_AIHUB_DISTANCE_MARGIN &&
-    angerScore >= LIVE_AIHUB_ANGER_SCORE_THRESHOLD &&
-    angerCoreDelta >= LIVE_AIHUB_MIN_ANGER_CORE_DELTA;
-
-  if (isUserNeutral || mediapipePercent < LIVE_MEDIAPIPE_NEUTRAL_THRESHOLD) {
-    if (angerCsvConfirms) {
+  if (mediapipePercent < LIVE_MEDIAPIPE_NEUTRAL_THRESHOLD) {
+    if (angerIsCloser && angerScore >= LIVE_AIHUB_ANGER_SCORE_THRESHOLD && angerCore >= LIVE_AIHUB_MIN_ANGER_CORE) {
       const meta = getLiveEmotionMeta("anger");
       return {
         id: "anger",
         label: meta.label,
         percent: Math.max(30, angerScore),
-        finalSource: "user_neutral_baseline+anger_csv",
+        finalSource: "csv_label_aux",
         mediapipeLabel,
         mediapipePercent,
       };
@@ -1532,65 +1484,32 @@ function getLiveDominantEmotion(scores, personalizedDetails) {
     return {
       id: "neutral",
       label: "Neutral",
-      percent: userNeutralScore,
-      finalSource: "user_neutral_baseline",
+      percent: neutralPercent,
+      finalSource: "csv_label_aux",
       mediapipeLabel,
       mediapipePercent,
     };
   }
 
   if (mediapipeDominant === "anger") {
-    if (angerCsvConfirms) {
-      const meta = getLiveEmotionMeta("anger");
-      return {
-        id: "anger",
-        label: meta.label,
-        percent: Math.max(mediapipePercent, angerScore),
-        finalSource: "relative_blendshape+anger_csv",
-        mediapipeLabel,
-        mediapipePercent,
-      };
-    }
-
-    const nonAngerScores = {
-      happiness: scores.happiness || 0,
-      sadness: scores.sadness || 0,
-      surprise: scores.surprise || 0,
-    };
-    const secondEmotionId = Object.keys(nonAngerScores).reduce((best, id) =>
-      nonAngerScores[id] > nonAngerScores[best] ? id : best
-    );
-    const secondPercent = nonAngerScores[secondEmotionId];
-
-    if (secondPercent >= LIVE_MEDIAPIPE_NEUTRAL_THRESHOLD) {
-      const meta = getLiveEmotionMeta(secondEmotionId);
-      return {
-        id: secondEmotionId,
-        label: meta.label,
-        percent: secondPercent,
-        finalSource: "relative_blendshape_anger_rejected",
-        mediapipeLabel,
-        mediapipePercent,
-      };
-    }
-
-    return {
-      id: "neutral",
-      label: "Neutral",
-      percent: userNeutralScore,
-      finalSource: "anger_rejected_as_neutral",
-      mediapipeLabel,
-      mediapipePercent,
-    };
-  }
-
-  if (angerCsvConfirms && mediapipePercent < 35) {
     const meta = getLiveEmotionMeta("anger");
     return {
       id: "anger",
       label: meta.label,
       percent: Math.max(mediapipePercent, angerScore),
-      finalSource: "anger_csv_override_low_confidence",
+      finalSource: "mediapipe+csv_score",
+      mediapipeLabel,
+      mediapipePercent,
+    };
+  }
+
+  if (angerIsCloser && angerScore >= 65 && angerCore >= LIVE_AIHUB_MIN_ANGER_CORE) {
+    const meta = getLiveEmotionMeta("anger");
+    return {
+      id: "anger",
+      label: meta.label,
+      percent: Math.max(mediapipePercent, angerScore),
+      finalSource: "csv_label_aux",
       mediapipeLabel,
       mediapipePercent,
     };
@@ -1601,7 +1520,7 @@ function getLiveDominantEmotion(scores, personalizedDetails) {
     id: mediapipeDominant,
     label: meta.label,
     percent: mediapipePercent,
-    finalSource: "relative_blendshape",
+    finalSource: "mediapipe",
     mediapipeLabel: meta.label,
     mediapipePercent,
   };
@@ -1616,28 +1535,26 @@ function mapBlendshapesToObject(blendshapes = []) {
 }
 
 function calculateLiveEmotionScores(rawBlendshapeMap, distributions = null) {
-  const relativeBlendshapeMap = appState.neutralCalibrationReady
-    ? applyLiveNeutralCalibration(rawBlendshapeMap)
-    : rawBlendshapeMap;
+  const emotionBlendshapeMap = rawBlendshapeMap;
 
-  const mouthSmileLeft = relativeBlendshapeMap.mouthSmileLeft || 0;
-  const mouthSmileRight = relativeBlendshapeMap.mouthSmileRight || 0;
-  const mouthFrownLeft = relativeBlendshapeMap.mouthFrownLeft || 0;
-  const mouthFrownRight = relativeBlendshapeMap.mouthFrownRight || 0;
-  const mouthPressLeft = relativeBlendshapeMap.mouthPressLeft || 0;
-  const mouthPressRight = relativeBlendshapeMap.mouthPressRight || 0;
-  const browInnerUp = relativeBlendshapeMap.browInnerUp || 0;
-  const browDownLeft = relativeBlendshapeMap.browDownLeft || 0;
-  const browDownRight = relativeBlendshapeMap.browDownRight || 0;
-  const browOuterUpLeft = relativeBlendshapeMap.browOuterUpLeft || 0;
-  const browOuterUpRight = relativeBlendshapeMap.browOuterUpRight || 0;
-  const eyeSquintLeft = relativeBlendshapeMap.eyeSquintLeft || 0;
-  const eyeSquintRight = relativeBlendshapeMap.eyeSquintRight || 0;
-  const eyeWideLeft = relativeBlendshapeMap.eyeWideLeft || 0;
-  const eyeWideRight = relativeBlendshapeMap.eyeWideRight || 0;
-  const noseSneerLeft = relativeBlendshapeMap.noseSneerLeft || 0;
-  const noseSneerRight = relativeBlendshapeMap.noseSneerRight || 0;
-  const jawOpen = relativeBlendshapeMap.jawOpen || 0;
+  const mouthSmileLeft = emotionBlendshapeMap.mouthSmileLeft || 0;
+  const mouthSmileRight = emotionBlendshapeMap.mouthSmileRight || 0;
+  const mouthFrownLeft = emotionBlendshapeMap.mouthFrownLeft || 0;
+  const mouthFrownRight = emotionBlendshapeMap.mouthFrownRight || 0;
+  const mouthPressLeft = emotionBlendshapeMap.mouthPressLeft || 0;
+  const mouthPressRight = emotionBlendshapeMap.mouthPressRight || 0;
+  const browInnerUp = emotionBlendshapeMap.browInnerUp || 0;
+  const browDownLeft = emotionBlendshapeMap.browDownLeft || 0;
+  const browDownRight = emotionBlendshapeMap.browDownRight || 0;
+  const browOuterUpLeft = emotionBlendshapeMap.browOuterUpLeft || 0;
+  const browOuterUpRight = emotionBlendshapeMap.browOuterUpRight || 0;
+  const eyeSquintLeft = emotionBlendshapeMap.eyeSquintLeft || 0;
+  const eyeSquintRight = emotionBlendshapeMap.eyeSquintRight || 0;
+  const eyeWideLeft = emotionBlendshapeMap.eyeWideLeft || 0;
+  const eyeWideRight = emotionBlendshapeMap.eyeWideRight || 0;
+  const noseSneerLeft = emotionBlendshapeMap.noseSneerLeft || 0;
+  const noseSneerRight = emotionBlendshapeMap.noseSneerRight || 0;
+  const jawOpen = emotionBlendshapeMap.jawOpen || 0;
 
   const smileAvg = (mouthSmileLeft + mouthSmileRight) / 2;
   const eyeWideAvg = (eyeWideLeft + eyeWideRight) / 2;
@@ -1708,17 +1625,12 @@ function calculateLiveEmotionScores(rawBlendshapeMap, distributions = null) {
     anger: Math.round(toPercent(angerRaw, "anger")),
     surprise: Math.round(toPercent(surpriseRaw, "surprise")),
   };
-  const userNeutral = calculateLiveUserNeutralScores(rawBlendshapeMap);
-  const aihub = calculateLiveAihubScores(rawBlendshapeMap, distributions, userNeutral.userNeutralDistance);
-  const dominant = getLiveDominantEmotion(scores, {
-    ...userNeutral,
-    ...aihub,
-    angerCoreDelta: calculateLiveAngerCore(relativeBlendshapeMap),
-  });
+  const aihub = calculateLiveAihubScores(rawBlendshapeMap, distributions);
+  const dominant = getLiveDominantEmotion(scores, aihub, rawBlendshapeMap);
 
   return {
     rawBlendshapeMap,
-    relativeBlendshapeMap,
+    relativeBlendshapeMap: emotionBlendshapeMap,
     raw: {
       happiness: joyRaw,
       sadness: sadnessRaw,
@@ -1731,14 +1643,16 @@ function calculateLiveEmotionScores(rawBlendshapeMap, distributions = null) {
     mediapipeLabel: dominant.mediapipeLabel,
     mediapipePercent: dominant.mediapipePercent,
     userNeutral: {
-      score: Math.round(userNeutral.userNeutralScore || 0),
-      distance: userNeutral.userNeutralDistance,
-      deltaEnergy: userNeutral.userNeutralDeltaEnergy,
+      score: 0,
+      distance: null,
+      deltaEnergy: 0,
     },
     aihub: {
       angerScore: Math.round(aihub.angerScore || 0),
+      neutralScore: Math.round(aihub.neutralScore || 0),
       referenceEmotion: aihub.referenceEmotion || "",
       angerDistance: aihub.angerDistance,
+      neutralDistance: aihub.neutralDistance,
     },
   };
 }
@@ -2066,8 +1980,8 @@ async function startLiveEmotionTracking(videoElement, canvasElement, hudElement)
     }
 
     appState.liveTrackingMessage = distributions
-      ? "Overlay ready with personalized neutral calibration and AI-Hub anger reference."
-      : "Overlay ready in MediaPipe-only preview mode. Final backend scoring still uses the calibrated model when available.";
+      ? "Overlay ready with the AI-Hub anger/neutral CSV distribution standard."
+      : "Overlay ready in MediaPipe-only preview mode. Final backend scoring still uses the AI-Hub CSV pipeline.";
 
     renderNeutralCalibrationStatus();
     updateRecordingStatusMessage();
@@ -2101,20 +2015,10 @@ async function startLiveEmotionTracking(videoElement, canvasElement, hudElement)
             box,
           };
           drawLivePreviewCanvas(canvasElement, videoElement, payload);
-          updateNeutralCalibrationFromAnalysis(payload, timestampMs);
-          if (appState.neutralCalibrationActive) {
-            renderLiveEmotionHud(hudElement, null, `Calibrating neutral face ${getLiveCalibrationProgressLabel()}`);
-          } else {
-            renderLiveEmotionHud(hudElement, payload);
-          }
+          renderLiveEmotionHud(hudElement, payload);
         } else {
           drawLivePreviewCanvas(canvasElement, videoElement, null);
-          updateNeutralCalibrationFromAnalysis(null, timestampMs);
-          renderLiveEmotionHud(
-            hudElement,
-            null,
-            appState.neutralCalibrationActive ? "Center your face to finish neutral calibration." : ""
-          );
+          renderLiveEmotionHud(hudElement, null);
         }
       } else {
         drawLivePreviewCanvas(canvasElement, videoElement, null);
@@ -2160,26 +2064,18 @@ function renderWorkflowStepper(activeStepId, caption = "") {
 
   return `
     <div class="workflow-strip">
-      <div class="workflow-strip-head">
-        <strong>Recommended order</strong>
-        <span>${escapeHtml(caption || "Follow the flow from left to right.")}</span>
-      </div>
       <div class="workflow-grid">
         ${WORKFLOW_STEPS.map((step, index) => {
           const stateClass = index < activeIndex ? "is-complete" : index === activeIndex ? "is-active" : "";
-          const status = index < activeIndex ? "Done" : index === activeIndex ? "Now" : "Next";
           return `
             <div class="workflow-step ${stateClass}">
               <div class="workflow-step-index">${index + 1}</div>
-              <div>
-                <strong>${step.label}</strong>
-                <div class="small-label">${step.detail}</div>
-              </div>
-              <span class="workflow-step-status">${status}</span>
+              <strong>${step.label}</strong>
             </div>
           `;
         }).join("")}
       </div>
+      ${caption ? `<p class="workflow-caption">${escapeHtml(caption)}</p>` : ""}
     </div>
   `;
 }
@@ -2188,11 +2084,7 @@ function buildSupportSummary(contextLabel = "") {
   const referenceLabel = appState.isDemoReference
     ? "Demo reference"
     : appState.referenceFile?.name || "No reference file selected";
-  const calibrationLabel = appState.neutralCalibrationReady
-    ? "Ready"
-    : appState.neutralCalibrationActive
-      ? `Running ${getLiveCalibrationProgressLabel()}`
-      : "Not started";
+  const csvPreviewLabel = appState.liveTrackingAvailable ? "Ready" : appState.liveTrackingMessage || "Not loaded";
 
   return [
     "HCI Acting Coach support summary",
@@ -2203,7 +2095,7 @@ function buildSupportSummary(contextLabel = "") {
     `Analysis mode: ${appState.analysisMode || "Pending"}`,
     `Last take source: ${getTakeSourceLabel(appState.lastTakeSource)}`,
     `Camera active: ${appState.recordingStream ? "Yes" : "No"}`,
-    `Neutral calibration: ${calibrationLabel}`,
+    `Live CSV preview: ${csvPreviewLabel}`,
     `Live overlay: ${appState.liveTrackingAvailable ? "Ready" : appState.liveTrackingMessage || "Unavailable"}`,
     `Analysis error: ${appState.analysisError || "None"}`,
     `Take error: ${appState.takeAnalysisError || "None"}`,
@@ -2309,7 +2201,7 @@ function renderRecordingControlGuide() {
       <div class="control-guide-card">
         <div class="small-label">Enable camera</div>
         <strong>Open the browser rehearsal preview</strong>
-        <p>Starts face tracking and the 3-second neutral calibration.</p>
+        <p>Starts face tracking with the same AI-Hub anger/neutral CSV reference used by backend analysis.</p>
       </div>
       <div class="control-guide-card">
         <div class="small-label">Start recording</div>
@@ -2336,88 +2228,15 @@ function renderUploadPage() {
 
   app.innerHTML = `
     <section class="screen">
-      <div class="hero-card">
-        ${renderWorkflowStepper("upload", "Upload first, then the app guides you through analysis, recording, and results.")}
-        <div class="hero-grid">
-          <div>
-            <span class="eyebrow">Acting Emotion Analysis Tool</span>
-            <h1 class="hero-title">Upload a reference performance and mirror its emotional contour.</h1>
-            <p class="hero-copy">
-              This app now runs the latest HCI-acting-coach pipeline end to end. Upload a reference clip, generate a fresh actor profile on the backend, then compare your own take with the same scoring logic.
-            </p>
-            <div class="hero-actions" style="margin-top: 1.3rem;">
-              <button class="button button-primary" data-action="go-analysis" ${file ? "" : "disabled"}>
-                Analyze reference clip
-              </button>
-              <button class="button button-secondary" data-action="load-demo">Use demo reference</button>
-            </div>
-            <div class="stat-strip">
-              <div class="stat-pill">
-                <span class="stat-label">Flow</span>
-                <span class="stat-value">4 stages</span>
-              </div>
-              <div class="stat-pill">
-                <span class="stat-label">Comparison</span>
-                <span class="stat-value">${EMOTION_META.length} emotions</span>
-              </div>
-              <div class="stat-pill">
-                <span class="stat-label">Output</span>
-                <span class="stat-value">Actionable notes</span>
-              </div>
-            </div>
-            <div class="callout" style="margin-top: 1.2rem;">
-              Uploaded reference clips now trigger the full Python inference pipeline end to end. The demo button still uses the bundled <strong>HCI-acting-coach</strong> sample CSVs when you want a quick rehearsal path.
-            </div>
-          </div>
-          <div class="preview-card">
-            <div class="video-shell">
-              ${
-                file && appState.referenceUrl
-                  ? `<video src="${appState.referenceUrl}" controls preload="metadata"></video>`
-                  : `<div class="empty-video">
-                      <div>
-                        <strong style="display:block; font-size: 1.1rem; margin-bottom: 0.5rem;">${appState.isDemoReference ? "Demo reference loaded" : "Reference preview"}</strong>
-                        <span>${
-                          appState.isDemoReference
-                            ? "An HCI-acting-coach rehearsal profile is ready. You can continue through analysis without uploading a clip."
-                            : "Upload a scene from the actor you want to study. The file previews locally first, then the backend rebuilds the actor emotion baseline from that exact clip."
-                        }</span>
-                      </div>
-                    </div>`
-              }
-            </div>
-            <div class="glass-card">
-              <div class="small-label">Current reference</div>
-              <div class="divider"></div>
-              ${
-                file
-                  ? `
-                    <div class="summary-list">
-                      <div class="summary-item">
-                        <strong>${escapeHtml(file.name)}</strong>
-                        <div class="upload-meta">
-                          <span class="meta-chip">${formatFileSize(file.size)}</span>
-                          <span class="meta-chip">${meta ? formatDuration(meta.duration) : "Reading duration..."}</span>
-                          <span class="meta-chip">${meta && meta.width ? `${meta.width}×${meta.height}` : "Video metadata pending"}</span>
-                        </div>
-                      </div>
-                    </div>
-                  `
-                  : `<p class="muted-copy">No reference file selected yet.</p>`
-              }
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="hero-grid">
-        <div class="panel-card">
+      <div class="hero-card upload-focus">
+        ${renderWorkflowStepper("upload")}
+        <div class="upload-layout">
           <div class="upload-zone ${appState.isDragging ? "is-dragging" : ""}" id="upload-zone">
             <input id="reference-input" type="file" accept="video/*" />
             <div>
               <div class="upload-icon">⬆</div>
-              <h2 style="margin: 1rem 0 0.4rem;">Upload the actor's performance video</h2>
-              <p class="muted-copy">Drag and drop a video here, or click to choose a file from your device.</p>
+              <h2>Upload actor video</h2>
+              <p class="muted-copy">Drop a clear face video here, or click to choose one.</p>
               ${
                 file
                   ? `<div class="upload-meta" style="justify-content:center;">
@@ -2428,18 +2247,50 @@ function renderUploadPage() {
               }
             </div>
           </div>
-        </div>
 
-        ${renderSupportCard({
-          context: "upload",
-          title: "Start here in under one minute",
-          intro: "This screen is only for choosing the actor reference. The next screen runs the backend analysis automatically.",
-          steps: [
-            { title: "Upload one clear face video", copy: "A front-facing MP4, MOV, or browser recording works best." },
-            { title: "Press Analyze reference clip", copy: "The analysis server rebuilds the actor emotion profile from that exact clip." },
-            { title: "Wait for automatic move to recording", copy: "When analysis finishes, the app sends you to the rehearsal screen by itself." },
-          ],
-        })}
+          <div class="upload-side">
+            <span class="eyebrow">Acting Coach</span>
+            <h1 class="hero-title">Choose a reference. Then rehearse.</h1>
+            <p class="hero-copy">
+              Upload one actor clip, analyze it, and record your take against the same emotion profile.
+            </p>
+            <div class="hero-actions" style="margin-top: 1.3rem;">
+              <button class="button button-primary" data-action="go-analysis" ${file ? "" : "disabled"}>
+                Analyze reference
+              </button>
+              <button class="button button-secondary" data-action="load-demo">Use demo</button>
+            </div>
+
+            <div class="reference-summary">
+              <div class="small-label">Current reference</div>
+              ${
+                file
+                  ? `
+                    <strong>${escapeHtml(file.name)}</strong>
+                    <div class="upload-meta">
+                      <span class="meta-chip">${formatFileSize(file.size)}</span>
+                      <span class="meta-chip">${meta ? formatDuration(meta.duration) : "Reading duration..."}</span>
+                      <span class="meta-chip">${meta && meta.width ? `${meta.width}x${meta.height}` : "Video metadata pending"}</span>
+                    </div>
+                  `
+                  : `<p class="muted-copy">No file selected yet.</p>`
+              }
+            </div>
+
+            <div class="video-shell video-shell-compact">
+              ${
+                file && appState.referenceUrl
+                  ? `<video src="${appState.referenceUrl}" controls preload="metadata"></video>`
+                  : `<div class="empty-video">
+                      <div>
+                        <strong style="display:block; font-size: 1.05rem; margin-bottom: 0.4rem;">${appState.isDemoReference ? "Demo loaded" : "Preview"}</strong>
+                        <span>${appState.isDemoReference ? "Ready to analyze the demo reference." : "Your selected clip will appear here."}</span>
+                      </div>
+                    </div>`
+              }
+            </div>
+          </div>
+        </div>
       </div>
     </section>
   `;
@@ -2497,14 +2348,11 @@ function renderAnalysisPage() {
       <div class="panel-card">
         ${routeHead(
           "Reference Analysis",
-          "Analyzing the actor's emotions frame by frame",
-          appState.isDemoReference ? "Loading HCI demo reference profile" : "Running HCI-acting-coach video inference",
+          "Analyzing reference",
+          appState.isDemoReference ? "Loading demo profile" : "Running video inference",
           '<button class="button button-ghost" data-action="back-home">Choose another clip</button>'
         )}
-        ${renderWorkflowStepper("analysis", "Analysis runs automatically here. You will move to recording as soon as it finishes.")}
-        <div class="callout callout-info" style="margin-top: 1rem;">
-          This is the backend analysis stage. When it reaches 100%, the app opens the recording screen automatically, and the reference emotion read appears directly below the actor preview there.
-        </div>
+        ${renderWorkflowStepper("analysis", "Recording opens automatically when analysis finishes.")}
         <div class="analysis-grid" style="margin-top: 1.5rem;">
           <div class="panel-card" style="background: rgba(7, 17, 31, 0.52);">
             <div class="video-shell">
@@ -2535,13 +2383,6 @@ function renderAnalysisPage() {
             <div class="small-label">Pipeline status</div>
             <div class="divider"></div>
             <div id="analysis-timeline" class="timeline"></div>
-            <div class="callout callout-muted" style="margin-top: 1rem;">
-              ${
-                appState.isDemoReference
-                  ? "Using the bundled HCI actor sample so you can test the full workflow immediately."
-                  : "Uploading your reference clip to the analysis server, then rebuilding actor_expression.csv with the latest HCI-acting-coach MediaPipe pipeline."
-              }
-            </div>
           </div>
         </div>
       </div>
@@ -2716,7 +2557,8 @@ async function prepareCamera(videoElement) {
     videoElement.srcObject = stream;
     await videoElement.play();
     appState.cameraError = "";
-    startNeutralCalibration();
+    resetNeutralCalibration();
+    appState.liveTrackingMessage = "Camera enabled. Live analysis uses the AI-Hub anger/neutral CSV distribution standard.";
   } catch (error) {
     appState.cameraError = isLocalDesktopWebcamAvailable()
       ? "Camera access was denied or unavailable. You can still run the desktop webcam model or use the bundled sample take."
@@ -2758,13 +2600,6 @@ function beginCameraRecording() {
 
   recorder.addEventListener("stop", () => {
     const blob = new Blob(appState.recordingChunks, { type: recorder.mimeType || "video/webm" });
-    const neutralProfile =
-      appState.neutralBlendshapeBaseline && appState.neutralBlendshapeStd
-        ? {
-            baseline: { ...appState.neutralBlendshapeBaseline },
-            std: { ...appState.neutralBlendshapeStd },
-          }
-        : null;
     if (appState.recordedUrl) {
       URL.revokeObjectURL(appState.recordedUrl);
     }
@@ -2776,7 +2611,7 @@ function beginCameraRecording() {
     setTakeAnalysisState(true, "Uploading your recorded take and running HCI video analysis on the server.");
     renderRoute();
 
-    analyzeRecordedTake(blob, neutralProfile)
+    analyzeRecordedTake(blob)
       .then((payload) => {
         setTakeAnalysisState(false);
         applyComparisonPayload(payload, "recorded-video");
@@ -2892,19 +2727,58 @@ function renderRecordingPage() {
       <div class="panel-card recording-shell">
         ${routeHead(
           "Record Your Take",
-          "Match the actor's emotional rhythm and capture your performance.",
+          "Record your take",
           `${appState.analysisFrameCount} reference frames are ready`,
           '<button class="button button-ghost" data-action="back-analysis">Re-run analysis</button>'
         )}
-        ${renderWorkflowStepper("recording", "Follow the guide below from left to right. Results open automatically after backend analysis.")}
+        ${renderWorkflowStepper("recording", "Enable camera, record, then analyze.")}
 
-        <div class="callout callout-info">
-          Use this order: <strong>Enable camera</strong> → hold a neutral face for 3 seconds → <strong>Start recording</strong> → <strong>Stop and analyze</strong>. The analyzed reference emotion summary is directly below the actor preview on the left.
+        <div class="recording-toolbar">
+          <div class="toolbar-copy">
+            <div class="small-label">Controls</div>
+            <strong>Enable camera > Record > Analyze</strong>
+          </div>
+          <div class="inline-actions recording-actions recording-actions-primary">
+            <button class="button button-secondary" data-action="enable-camera" ${
+              appState.takeAnalysisInFlight ? "disabled" : ""
+            }>
+              ${appState.recordingStream ? "Refresh camera" : "Enable camera"}
+            </button>
+            <button class="button button-primary" data-action="start-recording" ${
+              appState.recordingStream &&
+              !appState.takeAnalysisInFlight &&
+              !activeRecorder
+                ? ""
+                : "disabled"
+            }>
+              ${activeRecorder ? "Recording..." : "Start recording"}
+            </button>
+            <button class="button ${activeRecorder ? "button-primary" : "button-secondary"}" data-action="stop-recording" ${
+              activeRecorder && !appState.takeAnalysisInFlight ? "" : "disabled"
+            }>
+              Stop and analyze
+            </button>
+          </div>
+          <details class="secondary-actions">
+            <summary>More options</summary>
+            <div class="inline-actions">
+            ${
+              desktopWebcamAvailable
+                ? `<button class="button button-secondary" data-action="desktop-webcam" ${
+                    appState.takeAnalysisInFlight ? "disabled" : ""
+                  }>
+              Run desktop webcam model
+            </button>`
+                : ""
+            }
+            <button class="button button-ghost" data-action="fallback-recording" ${
+              appState.takeAnalysisInFlight ? "disabled" : ""
+            }>
+              Use sample take
+            </button>
+            </div>
+          </details>
         </div>
-
-        <p class="recording-lead">
-          Keep the actor clip visible on the left, answer it with your own face on the right, and let the browser preview your expression match before the backend scores the final take with your personalized neutral baseline plus the AI-Hub anger reference.
-        </p>
 
         <div class="rehearsal-stage-shell">
           <div class="rehearsal-stage-header">
@@ -2925,8 +2799,8 @@ function renderRecordingPage() {
                 <div class="pane-heading">
                   <div class="pane-icon">🎬</div>
                   <div class="pane-title">
-                    <div class="small-label">Reference clip</div>
-                    <strong>Uploaded actor performance</strong>
+                    <div class="small-label">Reference</div>
+                    <strong>Actor clip</strong>
                   </div>
                 </div>
                 <span class="meta-chip">${appState.isDemoReference ? "Demo source" : "Your upload"}</span>
@@ -2946,11 +2820,9 @@ function renderRecordingPage() {
                   <div class="frame-countdown-overlay hidden" data-countdown-overlay></div>
                 </div>
               </div>
-              <div class="pane-inline-note">Reference emotion analysis appears directly below this preview.</div>
               <div class="pane-analysis-stack">
                 <div id="reference-analysis-hud" class="emotion-hud emotion-hud-inline emotion-hud-reference"></div>
               </div>
-              <p class="pane-note">Watch the rhythm, eye focus, and tension changes in the actor's face before you start your own take.</p>
             </article>
 
             <article class="rehearsal-pane rehearsal-pane-live">
@@ -2958,11 +2830,11 @@ function renderRecordingPage() {
                 <div class="pane-heading">
                   <div class="pane-icon pane-icon-live">📷</div>
                   <div class="pane-title">
-                    <div class="small-label">Live camera</div>
-                    <strong>Real-time rehearsal preview</strong>
+                    <div class="small-label">Your take</div>
+                    <strong>Live camera</strong>
                   </div>
                 </div>
-                <span class="meta-chip">Face + emotion overlay</span>
+                <span class="meta-chip">Live preview</span>
               </div>
               <div class="camera-frame">
                 <video id="camera-preview" playsinline muted class="source-camera-stream ${appState.recordedUrl ? "hidden" : ""}"></video>
@@ -2973,7 +2845,7 @@ function renderRecordingPage() {
                     : `<div class="empty-video ${appState.recordingStream ? "hidden" : ""}" id="camera-empty">
                         <div>
                           <strong style="display:block; font-size: 1.15rem; margin-bottom: 0.5rem;">Camera preview</strong>
-                          <span>Enable your camera to rehearse live. While you record, the browser overlays face tracking and emotion percentages in real time.</span>
+                          <span>Enable your camera to begin.</span>
                         </div>
                       </div>`
                 }
@@ -2986,7 +2858,6 @@ function renderRecordingPage() {
                   <div class="frame-countdown-overlay hidden" data-countdown-overlay></div>
                 </div>
               </div>
-              <div class="pane-inline-note">The live label should settle near Neutral after calibration if your face is resting.</div>
               <div class="pane-analysis-stack">
                 <div id="live-analysis-hud" class="emotion-hud emotion-hud-inline"></div>
                 <div class="camera-footer camera-footer-static">
@@ -3004,102 +2875,13 @@ function renderRecordingPage() {
                   <div class="small-label">Mirror the actor's rise, hold, and release.</div>
                 </div>
               </div>
-              <p class="pane-note">Use the live overlay as a guide while you perform, then stop to send the take for final scoring.</p>
             </article>
           </div>
         </div>
 
-        <div class="recording-toolbar">
-          <div class="toolbar-copy">
-            <div class="small-label">Rehearsal controls</div>
-            <strong>Record the take, then send it to the backend.</strong>
-            <p>${
-              desktopWebcamAvailable
-                ? "Use the live browser preview for quick rehearsal, or switch to the original desktop webcam model if you want the Python camera flow."
-                : "Use the live browser preview for quick rehearsal. On the deployed site, the browser camera path is the supported live flow."
-            }</p>
-          </div>
-          <div class="inline-actions recording-actions">
-            <button class="button button-secondary" data-action="enable-camera" ${
-              appState.takeAnalysisInFlight ? "disabled" : ""
-            }>
-              ${appState.recordingStream ? "Refresh camera + recalibrate" : "Enable camera"}
-            </button>
-            <button class="button button-primary" data-action="start-recording" ${
-              appState.recordingStream &&
-              !appState.takeAnalysisInFlight &&
-              !activeRecorder
-                ? ""
-                : "disabled"
-            }>
-              ${activeRecorder ? "Recording..." : "Start recording"}
-            </button>
-            <button class="button ${activeRecorder ? "button-primary" : "button-secondary"}" data-action="stop-recording" ${
-              activeRecorder && !appState.takeAnalysisInFlight ? "" : "disabled"
-            }>
-              Stop and analyze
-            </button>
-            ${
-              desktopWebcamAvailable
-                ? `<button class="button button-secondary" data-action="desktop-webcam" ${
-                    appState.takeAnalysisInFlight ? "disabled" : ""
-                  }>
-              Run desktop webcam model
-            </button>`
-                : ""
-            }
-            <button class="button button-ghost" data-action="fallback-recording" ${
-              appState.takeAnalysisInFlight ? "disabled" : ""
-            }>
-              Use sample take
-            </button>
-          </div>
-        </div>
-
-        ${renderRecordingControlGuide()}
-
         <div class="recording-support-grid">
           <div id="neutral-calibration-panel"></div>
           <div id="recording-status-message"></div>
-        </div>
-
-        ${renderSupportCard({
-          context: "recording",
-          title: "Rehearsal checklist",
-          intro: "If a button feels unclear, use this sequence. The final result screen opens by itself after backend analysis.",
-          steps: [
-            { title: "Enable camera first", copy: "This starts the browser preview and your neutral baseline calibration." },
-            { title: "Wait for calibration to finish", copy: "Start recording unlocks only after the preview learns your resting face." },
-            { title: "Stop and analyze when the take ends", copy: "The backend receives the take and returns the comparison board automatically." },
-          ],
-        })}
-
-        <div class="reference-signal-strip">
-          <div class="signal-card signal-card-emphasis">
-            <span class="signal-label">Dominant emotion</span>
-            <strong>${leadEmotion.label}</strong>
-            <span class="signal-meta">${leadEmotionMeta}</span>
-          </div>
-          <div class="signal-card">
-            <span class="signal-label">Secondary emotion</span>
-            <strong>${supportEmotion.label}</strong>
-            <span class="signal-meta">${supportEmotion.actor}% support</span>
-          </div>
-          <div class="signal-card">
-            <span class="signal-label">Analyzed frames</span>
-            <strong>${appState.actorProfile.frameCount}</strong>
-            <span class="signal-meta">Backend timeline</span>
-          </div>
-          <div class="signal-card">
-            <span class="signal-label">Expression mode</span>
-            <strong>${appState.actorProfile.intensity}</strong>
-            <span class="signal-meta">${appState.actorProfile.pacing}</span>
-          </div>
-          <div class="signal-card">
-            <span class="signal-label">Reference duration</span>
-            <strong>${formatDuration(appState.actorProfile.referenceDurationSeconds || appState.referenceMeta?.duration || 0)}</strong>
-            <span class="signal-meta">${escapeHtml(appState.sourceLabel || "HCI-acting-coach actor baseline")}</span>
-          </div>
         </div>
 
         ${appState.takeAnalysisInFlight ? renderTakeAnalysisOverlay() : ""}

@@ -11,21 +11,20 @@ import pandas as pd
 
 from common import (
     DEFAULT_MODEL_PATH,
-    DEFAULT_USER_CSV_PATH,
+    DEFAULT_WEBCAM_CSV_PATH,
+    add_aihub_reference_scores,
     blendshapes_to_dict,
     build_face_landmarker,
-    build_user_neutral_distribution,
+    calculate_user_emotions,
     draw_emotion_box,
+    get_dominant_emotion,
     get_face_box,
-    save_distribution_csv,
-    save_user_neutral_profile,
-    score_personalized_user_frame,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze a live webcam performance with user neutral baseline calibration."
+        description="Analyze a live webcam performance with MediaPipe and AI-Hub anger/neutral CSV distributions."
     )
     parser.add_argument(
         "--camera-index",
@@ -48,32 +47,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-csv",
         type=Path,
-        default=DEFAULT_USER_CSV_PATH,
-        help="Path to save the webcam analysis CSV.",
+        default=DEFAULT_WEBCAM_CSV_PATH,
+        help="Path to save webcam_expression_mediapipe_with_aihub_csv.csv.",
     )
     parser.add_argument(
         "--sample-every",
         type=int,
         default=3,
         help="Analyze every Nth frame.",
-    )
-    parser.add_argument(
-        "--calibration-seconds",
-        type=float,
-        default=3.0,
-        help="Seconds to collect a neutral baseline before analysis.",
-    )
-    parser.add_argument(
-        "--baseline-min-samples",
-        type=int,
-        default=10,
-        help="Minimum neutral samples required before the run can continue.",
-    )
-    parser.add_argument(
-        "--baseline-output",
-        type=Path,
-        default=None,
-        help="Optional path to save the calibrated neutral profile as JSON or CSV.",
     )
     return parser.parse_args()
 
@@ -131,80 +112,6 @@ def detect_face(detector, frame):
     return detection_result.face_landmarks[0], detection_result.face_blendshapes[0]
 
 
-def collect_user_neutral_baseline(
-    cap: cv2.VideoCapture,
-    detector,
-    sample_every: int,
-    calibration_seconds: float,
-    baseline_min_samples: int,
-) -> dict[str, dict[str, float]] | None:
-    print("\n[Baseline] Look at the camera with a neutral face for calibration.")
-    print("[Baseline] This neutral profile becomes the personal reference for emotion sensitivity.")
-
-    samples: list[dict[str, float]] = []
-    calibration_start_time = time.time()
-    calibration_frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            print("[Baseline] Could not read a webcam frame.")
-            return None
-
-        calibration_frame_idx += 1
-        frame = cv2.flip(frame, 1)
-        height, width, _ = frame.shape
-
-        elapsed = time.time() - calibration_start_time
-        remaining = max(0.0, calibration_seconds - elapsed)
-
-        if calibration_frame_idx % max(1, sample_every) == 0:
-            face_landmarks, blendshapes = detect_face(detector, frame)
-            if face_landmarks is not None and blendshapes is not None:
-                raw_blendshapes = blendshapes_to_dict(blendshapes)
-                samples.append(raw_blendshapes)
-
-                box = get_face_box(face_landmarks, width, height)
-                cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (255, 255, 255), 2)
-
-        draw_status_text(frame, "Neutral calibration: keep a neutral face", 35)
-        draw_status_text(frame, f"Remaining: {remaining:.1f}s | samples: {len(samples)}", 70)
-        cv2.imshow("HCI Acting Coach Webcam Analysis", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("[Baseline] Stopped by user input.")
-            return None
-
-        if elapsed >= calibration_seconds:
-            break
-
-    if len(samples) < baseline_min_samples:
-        print(
-            f"[Baseline] Not enough neutral samples. "
-            f"Collected: {len(samples)}, required: {baseline_min_samples}"
-        )
-        return None
-
-    print(f"[Baseline] Neutral calibration complete with {len(samples)} samples.")
-    return build_user_neutral_distribution(samples)
-
-
-def maybe_save_neutral_profile(
-    neutral_distribution: dict[str, dict[str, float]],
-    output_path: Path | None,
-) -> None:
-    if output_path is None:
-        return
-
-    if output_path.suffix.lower() == ".csv":
-        save_distribution_csv(neutral_distribution, output_path)
-        print(f"[Baseline] Saved neutral profile CSV to {output_path}")
-        return
-
-    save_user_neutral_profile(neutral_distribution, output_path)
-    print(f"[Baseline] Saved neutral profile JSON to {output_path}")
-
-
 def main() -> int:
     args = parse_args()
     detector = build_face_landmarker(args.model_path)
@@ -214,24 +121,9 @@ def main() -> int:
         print("Could not open a webcam. Check the camera connection and permissions.")
         return 1
 
-    print("Webcam analysis started with personalized neutral baseline calibration.")
+    print("Webcam analysis started with the AI-Hub anger/neutral CSV pipeline.")
     print(f"Using camera index: {camera_index}")
-
-    neutral_distribution = collect_user_neutral_baseline(
-        cap,
-        detector,
-        args.sample_every,
-        args.calibration_seconds,
-        args.baseline_min_samples,
-    )
-
-    if neutral_distribution is None:
-        cap.release()
-        cv2.destroyAllWindows()
-        return 1
-
-    maybe_save_neutral_profile(neutral_distribution, args.baseline_output)
-    print("Personalized emotion analysis is now active. Press q to finish and save the CSV.")
+    print("Press q to finish and save the CSV.")
 
     results: list[dict[str, float]] = []
     frame_idx = 0
@@ -239,7 +131,7 @@ def main() -> int:
     last_box = None
     last_emotion = "Neutral"
     last_percent = 0.0
-    last_source = "user_neutral_baseline"
+    last_source = "mediapipe"
 
     try:
         while True:
@@ -261,12 +153,17 @@ def main() -> int:
                         "frame": frame_idx,
                         "time": time.time() - start_time,
                     }
-                    data.update(score_personalized_user_frame(raw_blendshapes, neutral_distribution))
+                    data.update(raw_blendshapes)
+                    data = calculate_user_emotions(data)
+                    data = add_aihub_reference_scores(data)
+                    emotion, percent = get_dominant_emotion(data)
+                    data["dominant_emotion"] = emotion
+                    data["dominant_percent"] = percent
 
                     last_box = get_face_box(face_landmarks, width, height)
-                    last_emotion = str(data.get("dominant_emotion", "Neutral"))
-                    last_percent = float(data.get("dominant_percent", 0.0) or 0.0)
-                    last_source = str(data.get("final_source", "relative_blendshape"))
+                    last_emotion = emotion
+                    last_percent = percent
+                    last_source = str(data.get("final_source", "mediapipe"))
                     results.append(data)
 
             if last_box is not None:
@@ -292,7 +189,7 @@ def main() -> int:
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(results)
     df.to_csv(args.output_csv, index=False, encoding="utf-8-sig")
-    print(f"Saved user CSV to {args.output_csv}")
+    print(f"Saved webcam CSV to {args.output_csv}")
     print(f"Stored frames: {len(df)}")
 
     summary_columns = [
@@ -300,16 +197,13 @@ def main() -> int:
         "sadness",
         "anger",
         "surprise",
-        "user_neutral_score",
-        "user_neutral_distance",
-        "user_neutral_delta_energy",
+        "aihub_neutral_score",
         "aihub_anger_score",
+        "aihub_neutral_distance",
         "aihub_anger_distance",
-        "anger_core_delta",
+        "aihub_reference_emotion",
         "mediapipe_label",
         "mediapipe_percent",
-        "is_user_neutral",
-        "anger_csv_confirms",
         "final_source",
         "dominant_emotion",
         "dominant_percent",
