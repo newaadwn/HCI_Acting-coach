@@ -215,8 +215,8 @@ function buildTimeline(rows) {
           }
         : addNeutralScore(expressiveScores);
 
-    const dominantEmotion = resolveDominantEmotionLabel(row.dominant_emotion, scores);
-    const dominantScore = normalizePercentValue(pickFirstFinite(row.dominant_percent)) ?? scores[dominantEmotion];
+    const dominantEmotion = getDominantEmotion(scores);
+    const dominantScore = scores[dominantEmotion] ?? 0;
     const mediapipeScore = normalizePercentValue(pickFirstFinite(row.mediapipe_percent));
 
     return {
@@ -484,9 +484,24 @@ function deriveComparison(actorProfile, userProfile) {
     };
   });
 
-  const averageGap =
-    bars.reduce((sum, emotion) => sum + Math.abs(emotion.actor - emotion.user), 0) / bars.length;
-  const similarityScore = Math.round(clamp(100 - averageGap * 1.55, 48, 97));
+  // Neutral is a derived fallback, so keep the main score focused on expressive channels.
+  const expressiveBars = bars.filter((emotion) => emotion.id !== "neutral");
+  const leadEmotion = expressiveBars.reduce(
+    (best, emotion) => (emotion.actor > best.actor ? emotion : best),
+    expressiveBars[0] || bars[0]
+  );
+  const weightedGap = expressiveBars.reduce((sum, emotion) => {
+    const weight = emotion.id === leadEmotion.id ? 2 : 1;
+    return sum + Math.abs(emotion.actor - emotion.user) * weight;
+  }, 0);
+  const weightTotal = expressiveBars.reduce((sum, emotion) => sum + (emotion.id === leadEmotion.id ? 2 : 1), 0);
+  const actorIntensity =
+    expressiveBars.reduce((sum, emotion) => sum + emotion.actor, 0) / Math.max(1, expressiveBars.length);
+  const userIntensity =
+    expressiveBars.reduce((sum, emotion) => sum + emotion.user, 0) / Math.max(1, expressiveBars.length);
+  const expressiveGap = weightTotal ? weightedGap / weightTotal : 0;
+  const intensityGap = Math.abs(actorIntensity - userIntensity);
+  const similarityScore = Math.round(clamp(100 - expressiveGap * 1.5 - intensityGap * 0.75, 0, 100));
 
   const feedback = bars
     .map((emotion) => {

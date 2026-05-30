@@ -29,9 +29,6 @@ SENSITIVITY = {
 DEFAULT_EMOTION_KEYS = ["joy", "sadness", "anger", "surprise"]
 MEDIAPIPE_NEUTRAL_THRESHOLD = 15
 AIHUB_STD_FLOOR = 0.02
-AIHUB_ANGER_SCORE_THRESHOLD = 58
-AIHUB_DISTANCE_MARGIN = 0.95
-AIHUB_MIN_ANGER_CORE = 0.03
 LOW_INTENSITY_NEUTRAL_THRESHOLD = 40
 LOW_INTENSITY_NEUTRAL_AVERAGE = 28
 LOW_INTENSITY_NEUTRAL_ANGER_CORE = 0.22
@@ -351,9 +348,6 @@ def get_dominant_emotion(
     scores["mediapipe_label"] = mediapipe_emotion
     scores["mediapipe_percent"] = mediapipe_percent
 
-    aihub_neutral_distance = scores.get("aihub_neutral_distance")
-    aihub_anger_distance = scores.get("aihub_anger_distance")
-    aihub_anger_score = float(scores.get("aihub_anger_score", 0.0) or 0.0)
     aihub_neutral_score = float(scores.get("aihub_neutral_score", 0.0) or 0.0)
 
     anger_core = calculate_anger_core(scores)
@@ -365,38 +359,19 @@ def get_dominant_emotion(
         aihub_neutral_score,
     )
 
-    if aihub_neutral_distance is not None and aihub_anger_distance is not None:
-        anger_is_closer = aihub_anger_distance < aihub_neutral_distance * AIHUB_DISTANCE_MARGIN
-    else:
-        anger_is_closer = False
-
     low_intensity_neutral = (
         mediapipe_percent < LOW_INTENSITY_NEUTRAL_THRESHOLD
         and expressive_average < LOW_INTENSITY_NEUTRAL_AVERAGE
         and anger_core < LOW_INTENSITY_NEUTRAL_ANGER_CORE
-        and aihub_anger_score < LOW_INTENSITY_WEAK_ANGER_SCORE
+        and float(scores.get("aihub_anger_score", 0.0) or 0.0) < LOW_INTENSITY_WEAK_ANGER_SCORE
     )
 
     if low_intensity_neutral:
         scores["final_source"] = "csv_label_aux"
         result = ("Neutral", neutral_percent)
     elif mediapipe_percent < MEDIAPIPE_NEUTRAL_THRESHOLD:
-        if (
-            anger_is_closer
-            and aihub_anger_score >= AIHUB_ANGER_SCORE_THRESHOLD
-            and anger_core >= AIHUB_MIN_ANGER_CORE
-        ):
-            scores["final_source"] = "csv_label_aux"
-            result = ("Anger", max(30.0, aihub_anger_score))
-        else:
-            scores["final_source"] = "csv_label_aux"
-            result = ("Neutral", neutral_percent)
-    elif mediapipe_emotion == "Anger":
-        scores["final_source"] = "mediapipe+csv_score"
-        result = ("Anger", max(mediapipe_percent, aihub_anger_score))
-    elif anger_is_closer and aihub_anger_score >= 65 and anger_core >= AIHUB_MIN_ANGER_CORE:
         scores["final_source"] = "csv_label_aux"
-        result = ("Anger", max(mediapipe_percent, aihub_anger_score))
+        result = ("Neutral", neutral_percent)
     else:
         scores["final_source"] = "mediapipe"
         result = (mediapipe_emotion, mediapipe_percent)

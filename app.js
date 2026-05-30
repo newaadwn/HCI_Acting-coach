@@ -62,10 +62,6 @@ const LIVE_AIHUB_STD_FLOOR = 0.02;
 const LIVE_USER_STD_FLOOR = 0.015;
 const LIVE_USER_NEUTRAL_DISTANCE_THRESHOLD = 1.8;
 const LIVE_USER_NEUTRAL_DELTA_ENERGY_THRESHOLD = 0.025;
-const LIVE_AIHUB_ANGER_SCORE_THRESHOLD = 58;
-const LIVE_AIHUB_DISTANCE_MARGIN = 0.95;
-const LIVE_AIHUB_MIN_ANGER_CORE = 0.03;
-const LIVE_AIHUB_MIN_ANGER_CORE_DELTA = 0.03;
 const LIVE_LOW_INTENSITY_NEUTRAL_THRESHOLD = 40;
 const LIVE_LOW_INTENSITY_NEUTRAL_AVERAGE = 28;
 const LIVE_LOW_INTENSITY_NEUTRAL_ANGER_CORE = 0.22;
@@ -482,9 +478,24 @@ function deriveComparison(actorProfile, userProfile) {
     };
   });
 
-  const averageGap =
-    bars.reduce((sum, emotion) => sum + Math.abs(emotion.actor - emotion.user), 0) / bars.length;
-  const similarityScore = Math.round(clamp(100 - averageGap * 1.55, 48, 97));
+  // Neutral is a derived fallback, so keep the main score focused on expressive channels.
+  const expressiveBars = bars.filter((emotion) => emotion.id !== "neutral");
+  const leadEmotion = expressiveBars.reduce(
+    (best, emotion) => (emotion.actor > best.actor ? emotion : best),
+    expressiveBars[0] || bars[0]
+  );
+  const weightedGap = expressiveBars.reduce((sum, emotion) => {
+    const weight = emotion.id === leadEmotion.id ? 2 : 1;
+    return sum + Math.abs(emotion.actor - emotion.user) * weight;
+  }, 0);
+  const weightTotal = expressiveBars.reduce((sum, emotion) => sum + (emotion.id === leadEmotion.id ? 2 : 1), 0);
+  const actorIntensity =
+    expressiveBars.reduce((sum, emotion) => sum + emotion.actor, 0) / Math.max(1, expressiveBars.length);
+  const userIntensity =
+    expressiveBars.reduce((sum, emotion) => sum + emotion.user, 0) / Math.max(1, expressiveBars.length);
+  const expressiveGap = weightTotal ? weightedGap / weightTotal : 0;
+  const intensityGap = Math.abs(actorIntensity - userIntensity);
+  const similarityScore = Math.round(clamp(100 - expressiveGap * 1.5 - intensityGap * 0.75, 0, 100));
 
   const feedback = bars
     .map((emotion) => {
@@ -1437,25 +1448,18 @@ function getLiveDominantEmotion(scores, aihubDetails, rawBlendshapeMap) {
     return (scores[emotion.id] || 0) > (scores[best] || 0) ? emotion.id : best;
   }, LIVE_EMOTION_META[0].id);
   const mediapipePercent = scores[mediapipeDominant] || 0;
-  const neutralDistance = aihubDetails?.neutralDistance;
-  const angerDistance = aihubDetails?.angerDistance;
   const neutralScore = aihubDetails?.neutralScore || 0;
-  const angerScore = aihubDetails?.angerScore || 0;
   const angerCore = calculateLiveAngerCore(rawBlendshapeMap || {});
   const mediapipeLabel = getLiveEmotionMeta(mediapipeDominant).label;
   const expressiveAverage =
     LIVE_EMOTION_META.reduce((sum, emotion) => sum + (scores[emotion.id] || 0), 0) / LIVE_EMOTION_META.length;
   const neutralPercent = Math.max(100 - mediapipePercent, neutralScore);
-  const angerIsCloser =
-    neutralDistance != null && angerDistance != null
-      ? angerDistance < neutralDistance * LIVE_AIHUB_DISTANCE_MARGIN
-      : false;
 
   const lowIntensityNeutral =
     mediapipePercent < LIVE_LOW_INTENSITY_NEUTRAL_THRESHOLD &&
     expressiveAverage < LIVE_LOW_INTENSITY_NEUTRAL_AVERAGE &&
     angerCore < LIVE_LOW_INTENSITY_NEUTRAL_ANGER_CORE &&
-    angerScore < LIVE_LOW_INTENSITY_WEAK_ANGER_SCORE;
+    (aihubDetails?.angerScore || 0) < LIVE_LOW_INTENSITY_WEAK_ANGER_SCORE;
 
   if (lowIntensityNeutral) {
     return {
@@ -1469,46 +1473,10 @@ function getLiveDominantEmotion(scores, aihubDetails, rawBlendshapeMap) {
   }
 
   if (mediapipePercent < LIVE_MEDIAPIPE_NEUTRAL_THRESHOLD) {
-    if (angerIsCloser && angerScore >= LIVE_AIHUB_ANGER_SCORE_THRESHOLD && angerCore >= LIVE_AIHUB_MIN_ANGER_CORE) {
-      const meta = getLiveEmotionMeta("anger");
-      return {
-        id: "anger",
-        label: meta.label,
-        percent: Math.max(30, angerScore),
-        finalSource: "csv_label_aux",
-        mediapipeLabel,
-        mediapipePercent,
-      };
-    }
-
     return {
       id: "neutral",
       label: "Neutral",
       percent: neutralPercent,
-      finalSource: "csv_label_aux",
-      mediapipeLabel,
-      mediapipePercent,
-    };
-  }
-
-  if (mediapipeDominant === "anger") {
-    const meta = getLiveEmotionMeta("anger");
-    return {
-      id: "anger",
-      label: meta.label,
-      percent: Math.max(mediapipePercent, angerScore),
-      finalSource: "mediapipe+csv_score",
-      mediapipeLabel,
-      mediapipePercent,
-    };
-  }
-
-  if (angerIsCloser && angerScore >= 65 && angerCore >= LIVE_AIHUB_MIN_ANGER_CORE) {
-    const meta = getLiveEmotionMeta("anger");
-    return {
-      id: "anger",
-      label: meta.label,
-      percent: Math.max(mediapipePercent, angerScore),
       finalSource: "csv_label_aux",
       mediapipeLabel,
       mediapipePercent,
@@ -1535,7 +1503,10 @@ function mapBlendshapesToObject(blendshapes = []) {
 }
 
 function calculateLiveEmotionScores(rawBlendshapeMap, distributions = null) {
-  const emotionBlendshapeMap = rawBlendshapeMap;
+  const emotionBlendshapeMap =
+    appState.neutralBlendshapeBaseline && appState.neutralBlendshapeStd
+      ? applyLiveNeutralCalibration(rawBlendshapeMap)
+      : rawBlendshapeMap;
 
   const mouthSmileLeft = emotionBlendshapeMap.mouthSmileLeft || 0;
   const mouthSmileRight = emotionBlendshapeMap.mouthSmileRight || 0;
@@ -1626,7 +1597,7 @@ function calculateLiveEmotionScores(rawBlendshapeMap, distributions = null) {
     surprise: Math.round(toPercent(surpriseRaw, "surprise")),
   };
   const aihub = calculateLiveAihubScores(rawBlendshapeMap, distributions);
-  const dominant = getLiveDominantEmotion(scores, aihub, rawBlendshapeMap);
+  const dominant = getLiveDominantEmotion(scores, aihub, emotionBlendshapeMap);
 
   return {
     rawBlendshapeMap,
@@ -2015,10 +1986,20 @@ async function startLiveEmotionTracking(videoElement, canvasElement, hudElement)
             box,
           };
           drawLivePreviewCanvas(canvasElement, videoElement, payload);
-          renderLiveEmotionHud(hudElement, payload);
+          updateNeutralCalibrationFromAnalysis(payload, timestampMs);
+          if (appState.neutralCalibrationActive) {
+            renderLiveEmotionHud(hudElement, null, `Calibrating neutral face ${getLiveCalibrationProgressLabel()}`);
+          } else {
+            renderLiveEmotionHud(hudElement, payload);
+          }
         } else {
           drawLivePreviewCanvas(canvasElement, videoElement, null);
-          renderLiveEmotionHud(hudElement, null);
+          updateNeutralCalibrationFromAnalysis(null, timestampMs);
+          renderLiveEmotionHud(
+            hudElement,
+            null,
+            appState.neutralCalibrationActive ? "Center your face to finish neutral calibration." : ""
+          );
         }
       } else {
         drawLivePreviewCanvas(canvasElement, videoElement, null);
